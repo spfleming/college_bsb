@@ -1,0 +1,446 @@
+library(rvest)
+library(tidyverse)
+library(limSolve)
+
+# Scrape D1 Baseball for the Projections ----------------------------------
+
+url <- "https://d1baseball.com/projections/2022-field-of-64-projections-may-11/"
+
+dat <- read_html(url) %>% html_nodes("#tablepress-3053") %>% html_table() %>%
+  as.data.frame()
+
+regions = seq(1, 50, 7)
+seeds = seq(1, 64, 4)
+
+names(dat) <- c('regions1', "junk", "regions2")
+dat <- dat %>% select(-junk)
+
+
+all.regions <- data.frame(matrix(ncol = 1, nrow = 64))
+names(all.regions) <- c("region")
+
+j <- 1
+for(i in regions){
+  all.regions$region[j]<- dat$regions1[i]
+  j <- j + 4
+}
+for(i in regions){
+  all.regions$region[j] <- dat$regions2[i]
+  j <- j + 4
+}
+
+all.regions <- all.regions %>% fill(region, .direction = c("down"))
+
+teams <- dat %>% filter(!regions1 %in% all.regions$region & !regions2 %in% all.regions$region) %>% filter(regions1 != "" & regions2 != "")
+
+teams1 <- teams %>% select(teams = regions1)
+teams2 <- teams %>% select(teams = regions2)
+teams <- rbind(teams1, teams2)
+
+regionals <- cbind(all.regions, teams) %>%
+  separate(teams, into = c('seed', "junk", "junk2"), 
+           extra = "drop", remove = "FALSE", sep = " ") %>%
+  separate(teams, into = c("junk", "national"), sep = "\\(",
+           remove = "FALSE", extra = "drop") %>%
+  mutate(
+    national.seed = as.numeric(gsub("[()]", " ", national)),
+    team = gsub('[0-9.]', '', str_replace_all(teams, "[^[:alnum:]]", " "))) %>%
+  select(region, seed, national.seed, team) %>%
+  mutate(team = trimws(team)) %>%
+  # CORRECTIONS
+  mutate(
+    team = str_replace(team, "State", "St."),
+    team = case_when(
+    team == "Central Conn  St." ~ "Central Conn. St.",
+    team == "Southern Miss" ~ "Southern Miss.",
+    team == "Texas A M" ~ "Texas A&M",
+    team == "Florida A M" ~ "Florida A&M",
+    team == "NC St." ~ "NC State",
+    team == "Georgia Southern" ~ "Ga. Southern",
+    team == "Connecticut" ~ "UConn",
+    team == "Pennsylvania" ~ "Penn",
+    team == "SE Missouri St." ~ "Missouri St.",
+    team == "Army" ~ "Army West Point",
+    team == "College of Charleston" ~ "Col. of Charleston",
+    team == "Dallas Baptist" ~ "DBU",
+    team == "Miami" ~ "Miami (FL)",
+    TRUE ~ team
+  ))
+
+field <- regionals$team 
+  
+
+
+# Get Stats for Field of 64 -----------------------------------------------
+
+tms <- baseballr::ncaa_team_lu %>% 
+  filter(year == 2022 & division == 1) 
+tm.ids <- tms$school_id[tms$school %in% field]
+#Check for 64
+length(tm.ids)
+get_bats <- function(x){
+  print(tms$school[tms$school_id==x])
+  possibleError <- tryCatch(bat <- baseballr::ncaa_scrape(teamid = x, 
+                                                          year = 2022, 
+                                                          type = "batting"),
+                            error = function(e) e)
+  if(!inherits(possibleError, "error")){
+    bat <- as.data.frame(bat)
+  }
+}
+get_arms <- function(x){
+  print(tms$school[tms$school_id==x])
+  possibleError <- tryCatch(bat <- baseballr::ncaa_scrape(teamid = x, 
+                                                          year = 2022, 
+                                                          type = "pitching"),
+                            error = function(e) e)
+  if(!inherits(possibleError, "error")){
+    bat <- as.data.frame(bat)
+  }
+}
+
+batting <- purrr::map_dfr(tm.ids, get_bats)
+bats <- batting %>% mutate_if(is.numeric, ~replace_na(., 0))
+pitching <- purrr::map_dfr(tm.ids, get_arms)
+arms <- pitching %>% mutate_if(is.numeric, ~replace_na(., 0))
+
+
+
+# Create Stats: BATTING ------------------------------------------------------------
+
+
+#wRC – This is total runs created based of wOBA. It is calculated as (((wOBA – lgwOBA) / wOBAScale) + (lgR/PA)) * PA
+
+#wRAA – This is the number of runs above average based off wOBA. It is calculated as (wOBA – lgwOBA) / wOBAScale * PA
+
+#INDIVIDUAL
+wRAA <- bats %>% filter(!grepl("Totals", Player)) %>%
+  filter(AB > 0) %>%
+  mutate(
+  wOBA = (.75*BB + .76*HBP + .94*(H-`2B`-`3B`-HR) + 1.32*`2B` + 1.63*`3B` + 2.07*HR)/AB)
+
+avg.wOBA <- 0.360
+wOBA.scale <- 1.19
+runsPA <- 0.15
+
+
+wRAA <- wRAA %>% 
+  mutate(wRAA = AB*(wOBA - avg.wOBA)/wOBA.scale,
+         wRC = ((wOBA - avg.wOBA)/wOBA.scale + runsPA)*AB)
+
+team.info <- read.csv("~/Desktop/docs/bsb_teams.csv")
+#TEAM
+tm.wRAA <- bats %>% filter(!grepl("Totals", Player)) %>%
+  filter(AB > 0) %>%
+  mutate(
+    wOBA = (.75*BB + .76*HBP + .94*(H-`2B`-`3B`-HR) + 1.32*`2B` + 1.63*`3B` + 2.07*HR)) %>%
+  group_by(team=school) %>% summarize(wOBA = sum(wOBA), AB = sum(AB), players = n()) %>%
+  mutate(wRAA = AB/players*((wOBA/AB)-avg.wOBA)/wOBA.scale,
+         wOBA = wOBA/AB,
+         wRC = ((wOBA - avg.wOBA)/wOBA.scale + runsPA)*AB/players) %>%
+  left_join(team.info, by = c("team" = "school")) %>%
+mutate(logo = ifelse(team == "Central Conn. St.", "https://cdn.d1baseball.com/logos/teams/256/cconnst.png", logo)) %>% mutate(
+    logo = ifelse(team == "DBU", 
+                  "https://cdn.d1baseball.com/logos/teams/256/dallasbapt.png",
+                  ifelse(team == "Grand Canyon", "https://cdn.d1baseball.com/logos/teams/256/gcanyon.png",
+                         ifelse(team == "California Baptist", "https://cdn.d1baseball.com/logos/teams/256/californiabaptist.png", logo))))
+
+
+
+# Create Stats: PITCHING --------------------------------------------------
+
+#FIP = ((13*HR)+(3*(BB+HBP))-(2*K))/IP + constant
+
+fip.c <- 4.01
+
+# Individual 
+
+fips <- arms %>% filter(!grepl("Totals", Player)) %>%
+  filter(App > 0) %>%
+  mutate(FIP = ((13*`HR-A`) + 3*(BB+HB) - 2*SO)/IP + fip.c)
+
+# Team 
+fips.tm <- arms %>% filter(!grepl("Totals", Player)) %>%
+  filter(App > 0) %>%
+  mutate(FIP = ((13*`HR-A`) + 3*(BB+HB) - 2*SO)) %>%
+  group_by(team =school) %>%
+  summarize(FIP = sum(FIP), IP = sum(IP)) %>%
+  mutate(FIP = FIP/IP + fip.c)
+
+
+
+
+# Join and Graph ----------------------------------------------------------
+
+dat <- tm.wRAA %>% left_join(fips.tm) 
+
+dat %>% ggplot(aes(x=wRAA, y =FIP)) + 
+  ggimage::geom_image(aes(image = logo), asp = 16/9) + 
+  theme_minimal() + 
+  geom_hline(yintercept = mean(dat$FIP), linetype = "dashed", color = "red4", alpha = 0.5) + 
+  geom_vline(xintercept = mean(dat$wRAA), linetype = "dashed", color = "red4", alpha = 0.5) + 
+  scale_y_reverse(breaks = seq(6.5, 3.25, -0.25), labels = scales::number_format(accuracy = 0.01)) + 
+  scale_x_continuous(breaks = seq(3, 16, .5)) + 
+  labs(title = toupper("Team Strength in the College World Series"),
+  subtitle = "@D1Baseball Projected Field of 64 | May 11th",
+  caption = 
+  "FIP: Measures pitchers' run prevention independent of defense.
+  wRAA: Measures number of runs created compared to an average team." ) + 
+  theme(panel.grid.minor = element_blank(),
+        text = element_text(),
+        plot.title = element_text(face = "bold", hjust = .5, size = 30),
+        plot.subtitle = element_text(size = 19, hjust = .5),
+        axis.title = element_text(face = "bold"),
+        plot.caption = element_text(size = 12, hjust = 1))
+
+ggsave(file = "~/Desktop/teams64.png", height = 9, width = 16, dpi = 300)
+
+
+
+# SRS ---------------------------------------------------------------------
+#get games
+#Schedules
+
+days <- c(seq(17, 28, 1), seq(1, 31, 1), seq(1, 30, 1), seq(1, 11, 1))
+days <- str_pad(days, 2, pad = "0") %>%
+  as.data.frame() %>%
+  mutate(month = ifelse(row_number() < 13, "02",
+                        ifelse(row_number() < 43, "03", 
+                               ifelse(row_number() < 74, "04", "05"))))
+
+colnames(days) <- c("day", "month")
+
+ncaa_games <- function(month, day){
+  possibleError <- tryCatch(gms <- jsonlite::fromJSON(
+    paste0("https://data.ncaa.com/casablanca/scoreboard/baseball/d1/2022/", 
+           month, "/", day, "/scoreboard.json")) %>%
+      as.data.frame(),
+    error = function(e) e)
+  if(!inherits(possibleError, "error")){
+    gms <- gms
+  }
+}
+
+tictoc::tic()
+gms <- map2_dfr(days$month, days$day, ncaa_games) %>%
+  as.data.frame() 
+tictoc::toc()
+
+games <- gms %>% unnest(cols = c(game)) %>%
+  as.data.frame() %>%
+  unnest(cols = c(home)) %>%
+  unnest(cols = c(names)) %>%
+  unnest(cols = c(away), names_repair = "unique") %>%
+  unnest(cols = c(names), names_repair = "unique") %>%
+  as.data.frame() %>%
+  select(gameID, gameState, matchup = title, url, 
+         home.score = `score...4`,
+         home.conf = `conferences...13`,
+         away.conf = `conferences...29`,
+         home.char6 = `char6...5`,
+         home = `short...6`,
+         home.seo = `seo...7`,
+         home.winner = `winner...9`,
+         home.record = `description...11`,
+         away.score = `score...20`,
+         away.char6 = `char6...21`,
+         away = `short...22`,
+         away.seo = `seo...23`,
+         away.recrod = `description...27`) %>%
+  filter(gameState == "final") %>%
+  unnest(cols = c(home.conf)) %>%
+  unnest(cols = c(away.conf), names_repair = "unique") %>%
+  mutate(home.conf = `conferenceName...6`,
+         away.conf = `conferenceName...8`)
+
+# create and solve 
+ex.dat <- games %>% #filter(home.conf == away.conf) %>%
+  mutate(winner = ifelse(home.winner == TRUE, home, away),
+         loser = ifelse(winner == home, away, home),
+         win.score = ifelse(home.winner == TRUE, 
+                            as.numeric(home.score), as.numeric(away.score)),
+         lose.score = ifelse(winner == home, as.numeric(away.score), as.numeric(home.score)),
+         w.loc = ifelse(home.winner == TRUE, "H", "A")) %>%
+  select(winner, loser, win.score, lose.score, w.loc) %>% filter(!is.na(win.score) & !is.na(lose.score)) 
+
+all.teams <- unique(c(ex.dat$winner, ex.dat$loser))
+
+transform_wl <- function(game_data, team_id){
+  
+  col_w <- if_else(game_data$winner == team_id, 1, 0) %>%
+    na_if(0)
+  
+  col_l <- if_else(game_data$loser == team_id, -1, 0) %>%
+    na_if(0)
+  
+  col_all <- coalesce(col_w, col_l) %>%
+    tbl_df()
+  
+  return(col_all)
+  
+}
+
+srs_ex <- map(all.teams, ~ transform_wl(ex.dat, team_id = .x)) %>%
+  bind_cols() %>%
+  setNames(all.teams) %>%
+  replace(is.na(.), 0) %>%
+  mutate(loc = fct_recode(ex.dat$w.loc, "1" = "H", "-1" = "A",)) %>%
+  mutate(loc = as.numeric(as.character(loc))) %>%
+  select(loc, everything()) %>%
+  as.matrix()
+
+scorediff_ex <- ex.dat%>%
+  mutate(scorediff = as.numeric(win.score) - as.numeric(lose.score),
+         scorediff = ifelse(scorediff > 15, 15, scorediff)) %>%
+  select(scorediff) %>% 
+  as.matrix()
+
+results_ex <- lsei(srs_ex, scorediff_ex)
+
+
+srs <- tibble(team= colnames(srs_ex),
+              SRS = results_ex[[1]]) %>%
+  left_join(team.info, by = c("team" = "school")) %>% filter(!is.na(conference.x) | team == "Central Conn. St.") %>%
+  arrange(desc(SRS)) %>% select(team, SRS) %>%
+  filter(team %in% field)
+
+srs <- srs %>% left_join(regionals) %>% #filter(seed == 1) %>%
+  left_join(team.info, by = c('team' = 'school')) %>%
+  mutate(color = ifelse(color == "", "navy", color)) %>%
+  arrange(national.seed)
+
+col <- srs$color
+
+labels <- c()
+for (i in 1:length(srs$logo)){
+  
+  img.name <- srs$logo[i]
+  
+  labels <- c(labels, paste0(srs$national.seed[i], "<img src='", srs$logo[i],  "'width='55', aspect-ratio='16/9' />"))
+}
+
+a <- srs %>% 
+  ggplot(aes(x=reorder(team, national.seed), y = SRS, fill = reorder(team, national.seed))) + 
+  ggchicklet::geom_chicklet(alpha = 0.75, aes(y = SRS, fill = reorder(team, national.seed)))  + 
+  scale_fill_manual(values = col) +
+  scale_x_discrete(name = NULL, labels = labels, expand = c(0, 0)) +
+  theme_minimal() +
+  theme(
+    panel.grid.major.x =element_blank(),
+    plot.title = element_text(size = 36, hjust = 0, face = "bold"),
+    plot.subtitle = element_text(size = 24, hjust = 0),
+    plot.caption = element_text(size = 12), 
+    panel.grid.minor = element_blank(),
+    legend.position = "none", 
+    strip.text.x = element_blank(),
+    text = element_text(size = 20), 
+    plot.margin = unit(c(.75,.75,.75,.75), "cm"),
+    axis.text.x = ggtext::element_markdown()) + 
+  scale_y_continuous(breaks = seq(0, 9, .5), expand = c(0, 0)) + 
+  labs(
+    y = "Opponent-adjusted Net Runs/Game",
+    title = "Who's Overseeded?",
+    subtitle = "Comparing Advanced Stats with the @d1baseball Projected National Seeds"
+  )
+ggpreview <- function(...) {
+  fname <- tempfile(fileext = ".png")
+  ggsave(filename = fname, ...)
+  system2("open", fname)
+  invisible(NULL)
+}
+
+ggpreview(a, height = 9, width = 16, dpi = 300)
+
+
+# SRS TABLE ---------------------------------------------------------------
+
+
+dat1 <- srs %>% filter(row_number() < 17)
+dat2 <- srs %>% filter(row_number() > 16 & row_number() < 33)
+dat3 <- srs %>% filter(row_number() > 32 & row_number() < 49)
+dat4 <- srs %>% filter(row_number() > 48)
+
+colnames(dat1) <- paste0(colnames(dat1), "1")
+colnames(dat2) <- paste0(colnames(dat2), "2")
+colnames(dat3) <- paste0(colnames(dat3), "3")
+colnames(dat4) <- paste0(colnames(dat4), "4")
+tbl.dat <- cbind(dat1, dat2, dat3, dat4)
+
+tbl.dat %>% 
+  reactable(
+    pagination = FALSE,
+    defaultColDef = colDef(headerStyle = list(textAlign = "center")),
+    columns = list(
+      SRS1 = colDef(name = "",
+                    minWidth = 75,
+                    cell = color_tiles(.,  bold_text = TRUE, 
+                                       #box_shadow = TRUE, 
+                                       number_fmt = scales::number_format(accuracy = 0.01,
+                                                                          style_positive = "plus"),
+                                       colors =  c("#3F76B5", "#0755A5"),
+                                       text_size = 30)),
+      SRS2 = colDef(name = "",
+                    minWidth = 75,
+                    cell = color_tiles(.,  bold_text = TRUE, 
+                                       #box_shadow = TRUE, 
+                                       number_fmt = scales::number_format(accuracy = 0.01,
+                                                                          style_positive = "plus"),
+                                       colors = c("#A1BCDB", "#3F76B5"),
+                                       text_size = 30)),
+      SRS3 = colDef(name = "",
+                    minWidth = 75,
+                    cell = color_tiles(.,  bold_text = TRUE, 
+                                       #box_shadow = TRUE, 
+                                       number_fmt = scales::number_format(accuracy = 0.01,
+                                                                          style_positive = "plus"),
+                                       colors = c("white", "#A1BCDB"), 
+                                       text_size = 30)),
+      SRS4 = colDef(name = "",
+                    minWidth = 75,
+                    cell = color_tiles(.,  bold_text = TRUE, 
+                                       #box_shadow = TRUE, 
+                                       number_fmt = scales::number_format(accuracy = 0.01,
+                                                                          style_positive = "plus"),
+                                       colors = c("white"), 
+                                       text_size = 30)),
+      blank1 = colDef(name = "",
+                      maxWidth = 40), 
+      blank2 = colDef(name = "",
+                      minWidth = 40), 
+      blank3 = colDef(name = "",
+                      minWidth = 40), 
+      blank4 = colDef(name = "",
+                      minWidth = 40), 
+      rank1 = colDef(name = "", maxWidth = 40,
+                     style = list(fontWeight = 700, fontSize = "30px", align = "left")),
+      rank2 = colDef(name = "", maxWidth = 45,
+                     style = list(fontWeight = 700, fontSize = "30px", align = "left")),
+      rank3 = colDef(name = "", maxWidth = 45,
+                     style = list(fontWeight = 700, fontSize = "30px", align = "left")),
+      rank4 = colDef(name = "", maxWidth = 45,
+                     style = list(fontWeight = 700, fontSize = "30px", align = "left")),
+      logo1 = colDef(name = "",
+                     minWidth = 40,
+                     cell = embed_img(height = "35", width = "35")),
+      logo2 = colDef(name = "",
+                     minWidth = 40,
+                     cell = embed_img(height = "35", width = "35")),
+      logo3 = colDef(name = "",
+                     minWidth = 40,
+                     cell = embed_img(height = "35", width = "35")),
+      logo4 = colDef(name = "",
+                     minWidth = 40,
+                     cell = embed_img(height = "35", width = "35")),
+      team1 = colDef(name = "", minWidth = 175,
+                     style = list(fontSize = 28, textTransform = "uppercase")),
+      team2 = colDef(name = "", minWidth = 175,
+                     style = list(fontSize = 28, textTransform = "uppercase")),
+      team3 = colDef(name = "", minWidth = 175,
+                     style = list(fontSize = 28, textTransform = "uppercase")),
+      team4 = colDef(name = "", minWidth = 175,
+                     style = list(fontSize = 28, textTransform = "uppercase"))
+    )
+  ) %>%
+  reactablefmtr::add_title(title = "COLLEGE BASEBALL POWER RATINGS", align = "center", font_size = 44) %>%
+  reactablefmtr::add_subtitle(subtitle = "Opponent-Adjusted Net Runs/Game | Through May 10th, 2022", align = "center", font_size = 18)
+
